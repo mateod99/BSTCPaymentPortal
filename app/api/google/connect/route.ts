@@ -1,0 +1,4 @@
+import {config,run,id} from '@/lib/server/db';
+import {user,hash} from '@/lib/server/auth';
+export const dynamic='force-dynamic';
+export async function GET(req:Request){const u=await user(req);if(u?.role!=='admin')return Response.json({error:'Administrator sign-in required.'},{status:403});const c=config();if(!c.GOOGLE_CLIENT_ID||!c.GOOGLE_CLIENT_SECRET)return new Response('Google Sheets is not connected yet. Ask the club administrator to configure Google OAuth, then return to Reports & exports.',{status:503});const state=id()+id();await run('INSERT INTO tokens VALUES(?,?,?,?)',await hash(state),u.id,'google',Date.now()+600000);const params=new URLSearchParams({client_id:c.GOOGLE_CLIENT_ID,redirect_uri:new URL('/api/google/callback',req.url).href,response_type:'code',scope:'https://www.googleapis.com/auth/drive.file',state,prompt:'consent'});return Response.redirect('https://accounts.google.com/o/oauth2/v2/auth?'+params,302)}
