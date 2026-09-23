@@ -50,3 +50,96 @@ test('Stripe settings encrypt credentials and never return plaintext secrets',as
 test('fee waivers require an administrator and record an audit note',async()=>{await assert.rejects(call('staff','waive-fee',{id:rid,reason:'Scholarship'}),/Only administrators/);await call('admin','waive-fee',{id:rid,reason:'Scholarship'});assert.equal(database.prepare('SELECT payment_status FROM registrations WHERE id=?').get(rid).payment_status,'Waived');await assert.rejects(call('parent','checkout',{registrationId:rid}),/not eligible/)});
 
 test('only admins can publish waivers; old signatures stay exact and stale edits fail',async()=>{const before=database.prepare('SELECT * FROM signed_waivers WHERE registration_id=?').get(rid);const season=database.prepare('SELECT * FROM seasons WHERE id=?').get(seasonId);await assert.rejects(call('parent','waivers/save',{seasonId,text:'Unauthorized edit',version:season.version}),/access is required/);await assert.rejects(call('staff','waivers/save',{seasonId,text:'Unauthorized edit',version:season.version}),/Only administrators/);const result=await call('admin','waivers/save',{seasonId,text:'New administrator-approved participation waiver text.',version:season.version});assert.equal(result.version,season.version+1);const after=database.prepare('SELECT * FROM signed_waivers WHERE registration_id=?').get(rid);assert.deepEqual(after,before);const h=await call('admin','waivers/history/'+seasonId);assert.equal(h.versions.length,2);assert.equal(h.versions[1].text,season.waiver);await assert.rejects(call('admin','waivers/save',{seasonId,text:'Stale update',version:season.version}),/updated this waiver/);});
+
+
+test('failed verification delivery can be retried without replacing the account',async()=>{
+ const originalFetch=globalThis.fetch;const c=globalThis.__bstcEnv;
+ c.RESEND_API_KEY='test-email-provider';c.EMAIL_FROM='BSTC <club@example.test>';
+ const email='retry@example.test',pass='retry-password-123';let delivered;
+ try{
+  globalThis.fetch=async()=>new Response('',{status:503});
+  await assert.rejects(call(null,'auth/signup',{email,name:'Retry Parent',password:pass}),/account was saved/);
+  const saved=database.prepare('SELECT * FROM users WHERE email=?').get(email);
+  assert.equal(saved.verified,0);
+  globalThis.fetch=async(_url,options)=>{delivered=JSON.parse(options.body);return Response.json({id:'email-test'});};
+  await call(null,'auth/resend',{email,password:'wrong-password'});assert.equal(delivered,undefined);
+  await call(null,'auth/resend',{email,password:pass});
+  const token=new URL(delivered.text.match(/https:\/\/\S+/)[0]).searchParams.get('verify');
+  await call(null,'auth/verify',{token});
+  assert.equal(database.prepare('SELECT verified FROM users WHERE id=?').get(saved.id).verified,1);
+  assert.match((await call(null,'auth/login',{email,password:pass})).headers.get('set-cookie'),/HttpOnly/);
+  await assert.rejects(call(null,'auth/verify',{token}),/invalid or has expired/);
+  assert.ok(!JSON.stringify(database.prepare('SELECT body FROM notifications WHERE user_id=?').all(saved.id)).includes(token));
+ }finally{globalThis.fetch=originalFetch;delete c.RESEND_API_KEY;delete c.EMAIL_FROM;}
+});
+
+test('password reset invalidates previous sessions and every outstanding reset link',async()=>{
+ const originalFetch=globalThis.fetch;const c=globalThis.__bstcEnv;const messages=[];
+ c.RESEND_API_KEY='test-email-provider';c.EMAIL_FROM='BSTC <club@example.test>';
+ try{
+  globalThis.fetch=async(_url,options)=>{messages.push(JSON.parse(options.body));return Response.json({id:'email-test'});};
+  for(let i=0;i<2;i++)await call(null,'auth/forgot',{email:'retry@example.test'});
+  const tokens=messages.map(m=>new URL(m.text.match(/https:\/\/\S+/)[0]).searchParams.get('reset'));
+  await call(null,'auth/reset',{token:tokens[1],password:'changed-password-456'});
+  await assert.rejects(call(null,'auth/reset',{token:tokens[0],password:'stale-password-456'}),/invalid or has expired/);
+  const uid=database.prepare('SELECT id FROM users WHERE email=?').get('retry@example.test').id;
+  assert.equal(database.prepare('SELECT count(*) n FROM sessions WHERE user_id=?').get(uid).n,0);
+  await assert.rejects(call(null,'auth/login',{email:'retry@example.test',password:'retry-password-123'}),/incorrect/);
+  assert.equal((await call(null,'auth/login',{email:'retry@example.test',password:'changed-password-456'})).status,200);
+ }finally{globalThis.fetch=originalFetch;delete c.RESEND_API_KEY;delete c.EMAIL_FROM;}
+});
+
+test('reset requires a configured sender and failed delivery does not leave usable tokens',async()=>{
+ const originalFetch=globalThis.fetch;const c=globalThis.__bstcEnv;c.RESEND_API_KEY='test-email-provider';
+ try{
+  await assert.rejects(call(null,'auth/forgot',{email:'retry@example.test'}),/not connected/);
+  c.EMAIL_FROM='BSTC <club@example.test>';globalThis.fetch=async()=>new Response('',{status:503});
+  const result=await call(null,'auth/forgot',{email:'retry@example.test'});
+  assert.doesNotMatch(result.message,/has been sent/);
+  const uid=database.prepare('SELECT id FROM users WHERE email=?').get('retry@example.test').id;
+  assert.equal(database.prepare("SELECT count(*) n FROM tokens WHERE user_id=? AND kind='reset'").get(uid).n,0);
+ }finally{globalThis.fetch=originalFetch;delete c.RESEND_API_KEY;delete c.EMAIL_FROM;}
+});
+
+
+test('administrator bootstrap requires the configured identity and preserves existing roles',async()=>{
+ const {user}=await import(pathToFileURL(path.join(dir,'server/auth.mjs')));
+ const c=globalThis.__bstcEnv;
+ const request=email=>new Request('https://club.test',{headers:{'oai-authenticated-user-email':email}});
+ try{
+  delete c.ADMIN_EMAIL;assert.equal(await user(request('owner@example.test')),null);
+  c.ADMIN_EMAIL='owner@example.test';assert.equal(await user(request('stranger@example.test')),null);
+  const [first,second]=await Promise.all([user(request('OWNER@example.test')),user(request('owner@example.test'))]);
+  assert.equal(first.role,'admin');assert.equal(first.verified,1);assert.equal(second.id,first.id);
+  assert.equal(database.prepare('SELECT count(*) n FROM users WHERE email=?').get('owner@example.test').n,1);
+  sql('UPDATE users SET role=? WHERE id=?','parent',first.id);
+  assert.equal((await user(request('owner@example.test'))).role,'parent');
+ }finally{delete c.ADMIN_EMAIL;}
+});
+
+test('role changes reject missing or unverified accounts and protect self access',async()=>{
+ await assert.rejects(call('admin','users/role',{id:'missing-user',role:'admin'}),/Account not found/);
+ await assert.rejects(call('admin','users/role',{id:'admin',role:'parent'}),/own role/);
+ sql('UPDATE users SET verified=0 WHERE id=?','other');
+ try{for(const role of ['staff','admin'])await assert.rejects(call('admin','users/role',{id:'other',role}),/verify its email/);}
+ finally{sql('UPDATE users SET verified=1 WHERE id=?','other');}
+ await call('admin','users/role',{id:'other',role:'staff'});
+ assert.equal(database.prepare('SELECT role FROM users WHERE id=?').get('other').role,'staff');
+ await call('admin','users/role',{id:'other',role:'parent'});
+});
+
+test('parent dashboard and documents isolate family data',async()=>{
+ const own=await call('parent','bootstrap'),other=await call('other','bootstrap');
+ assert.ok(own.players.length>0);assert.ok(own.players.every(p=>p.owner==='parent'));assert.ok(other.players.every(p=>p.owner==='other'));assert.ok(!other.registrations.some(r=>r.id===rid));
+ assert.equal(own.users.length,0);assert.equal(own.logs.length,0);assert.equal(own.settings,undefined);
+ for(const path of ['waiver/','receipt/'])await assert.rejects(call('other',path+rid),/not found/);
+ for(const path of ['waiver/','receipt/'])assert.equal((await call('parent',path+rid)).status,200);
+});
+
+test('email readiness requires both API key and sender address',async()=>{
+ const c=globalThis.__bstcEnv;c.RESEND_API_KEY='test-only-key';
+ try{
+  delete c.EMAIL_FROM;assert.equal((await call('admin','bootstrap')).integrations.Email,false);
+  c.EMAIL_FROM='BSTC <club@example.test>';assert.equal((await call('admin','bootstrap')).integrations.Email,true);
+ }finally{delete c.RESEND_API_KEY;delete c.EMAIL_FROM;}
+});
