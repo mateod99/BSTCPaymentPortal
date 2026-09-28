@@ -12,7 +12,7 @@ database.exec('PRAGMA foreign_keys=ON');
 for(const f of fs.readdirSync('drizzle').filter(x=>x.endsWith('.sql')).sort())database.exec(fs.readFileSync('drizzle/'+f,'utf8'));
 function statement(sql,args=[]){return {bind(...a){return statement(sql,a)},async first(){return database.prepare(sql).get(...args)||null},async all(){return {results:database.prepare(sql).all(...args)}},async run(){const r=database.prepare(sql).run(...args);return {meta:{changes:r.changes}}}}}
 globalThis.__bstcEnv={DB:{prepare:statement,async batch(qs){database.exec('BEGIN');try{const a=[];for(const q of qs)a.push(await q.run());database.exec('COMMIT');return a}catch(e){database.exec('ROLLBACK');throw e}}}};
-for(const f of ['rules','demo','server/db','server/auth','server/service','server/xlsx','server/settings','server/waivers']){let source=fs.readFileSync('lib/'+f+'.ts','utf8').replace("import {env} from 'cloudflare:workers';",'const env=globalThis.__bstcEnv;');source=source.replace(/(from\s+['"]|import\(['"])(\.\.?\/[^'"]+)(['"])/g,(_,a,b,c)=>a+b+'.mjs'+c);const target=path.join(dir,f+'.mjs');fs.mkdirSync(path.dirname(target),{recursive:true});fs.writeFileSync(target,ts.transpileModule(source,{compilerOptions:{module:ts.ModuleKind.ESNext,target:ts.ScriptTarget.ES2022}}).outputText);}
+for(const f of ['rules','demo','server/db','server/auth','server/service','server/xlsx','server/settings','server/waivers','server/club-waivers']){let source=fs.readFileSync('lib/'+f+'.ts','utf8').replace("import {env} from 'cloudflare:workers';",'const env=globalThis.__bstcEnv;');source=source.replace(/(from\s+['"]|import\(['"])(\.\.?\/[^'"]+)(['"])/g,(_,a,b,c)=>a+b+'.mjs'+c);const target=path.join(dir,f+'.mjs');fs.mkdirSync(path.dirname(target),{recursive:true});fs.writeFileSync(target,ts.transpileModule(source,{compilerOptions:{module:ts.ModuleKind.ESNext,target:ts.ScriptTarget.ES2022}}).outputText);}
 const {handle}=await import(pathToFileURL(path.join(dir,'server/service.mjs')));
 const {password,session}=await import(pathToFileURL(path.join(dir,'server/auth.mjs')));
 const {ageAt,validateWaiver,csvCell}=await import(pathToFileURL(path.join(dir,'rules.mjs')));
@@ -22,6 +22,38 @@ for(const [id,role]of [['parent','parent'],['other','parent'],['admin','admin'],
 const cookies={};for(const id of ['parent','other','admin','staff'])cookies[id]=(await session(id)).split(';')[0];
 async function call(actor,route,body,method=body?'POST':'GET'){return handle(new Request('https://club.test/api/'+route,{method,headers:{...(actor?{cookie:cookies[actor]}:{}),...(body?{'Content-Type':'application/json',origin:'https://club.test'}:{})},body:body?JSON.stringify(body):undefined}),route)}
 let seasonId,playerId,rid;
+test('club waivers work without seasons and preserve private, immutable signatures',async()=>{
+ assert.equal(database.prepare('SELECT count(*) n FROM seasons').get().n,0);
+ const p=await call('parent','players',{name:'Standalone Child',dob:'2018-01-01',address:'Test',phone:'1',emergencyName:'Test Parent',emergencyPhone:'1',city:'Boston',state:'MA',zip:'02110',gender:'Other'});
+ const payload={playerId:p.id,version:1,agree:true,signer:'Test Parent',relationship:'Parent',date:today};
+ await assert.rejects(call('parent','club-waivers/sign',payload),/not published/);
+ for(const actor of ['parent','staff'])await assert.rejects(call(actor,'club-waivers/publish',{text:'Club waiver one',version:0}),/Only administrators/);
+ await call('admin','club-waivers/publish',{text:'Club waiver one',version:0});
+ await assert.rejects(call('other','club-waivers/sign',payload),/not found/);
+ await assert.rejects(call('parent','club-waivers/sign',{...payload,agree:false}),/agree/);
+ await assert.rejects(call('parent','club-waivers/sign',{...payload,relationship:'Adult player'}),/minor/);
+ await assert.rejects(call('parent','club-waivers/sign',{...payload,version:0}),/changed/);
+ sql('UPDATE users SET verified=0 WHERE id=?','parent');
+ try{await assert.rejects(call('parent','club-waivers/sign',payload),/Verify/);}finally{sql('UPDATE users SET verified=1 WHERE id=?','parent');}
+ const signed=await call('parent','club-waivers/sign',payload);
+ assert.equal((await call('parent','club-waivers/sign',payload)).id,signed.id);
+ for(const table of ['seasons','registrations','payments'])assert.equal(database.prepare('SELECT count(*) n FROM '+table).get().n,0);
+ const original=database.prepare('SELECT * FROM player_waivers WHERE id=?').get(signed.id);
+ assert.equal(original.player_name,'Standalone Child');assert.equal(original.text,'Club waiver one');
+ assert.throws(()=>sql('UPDATE player_waivers SET text=? WHERE id=?','changed',signed.id),/immutable/);
+ await call('admin','club-waivers/publish',{text:'Club waiver two',version:1});
+ await assert.rejects(call('admin','club-waivers/publish',{text:'Stale waiver',version:1}),/updated/);
+ await assert.rejects(call('parent','club-waivers/sign',payload),/changed/);
+ assert.deepEqual(database.prepare('SELECT * FROM player_waivers WHERE id=?').get(signed.id),original);
+ await assert.rejects(call('other','club-waivers/document/'+signed.id),/not found/);
+ for(const actor of ['parent','admin'])assert.match(await (await call(actor,'club-waivers/document/'+signed.id)).text(),/Club waiver one/);
+ assert.equal((await call('other','bootstrap')).clubWaivers.length,0);
+ assert.equal((await call('parent','bootstrap')).clubWaivers.length,1);
+ assert.equal((await call('admin','club-waivers/history')).versions.length,2);
+ const profile=JSON.parse(database.prepare('SELECT data FROM players WHERE id=?').get(p.id).data);
+ assert.equal(profile.city,'Boston');assert.equal(profile.state,'MA');assert.equal(profile.zip,'02110');assert.equal(profile.gender,'Other');
+});
+
 test('login rejects wrong password and unverified users, accepts valid credentials',async()=>{await assert.rejects(call(null,'auth/login',{email:'parent@example.test',password:'wrong'}),/incorrect/);sql('UPDATE users SET verified=0 WHERE id=?','parent');await assert.rejects(call(null,'auth/login',{email:'parent@example.test',password:'a-secure-password-123'}),/verify/);sql('UPDATE users SET verified=1 WHERE id=?','parent');const r=await call(null,'auth/login',{email:'parent@example.test',password:'a-secure-password-123'});assert.match(r.headers.get('set-cookie'),/HttpOnly; Secure; SameSite=Lax/)});
 test('anonymous and parent cannot manage seasons; staff cannot change roles',async()=>{await assert.rejects(call(null,'seasons',{}),/sign in/);await assert.rejects(call('parent','seasons',{}),/access is required/);await assert.rejects(call('staff','users/role',{id:'other',role:'admin'}),/Only administrators/)});
 test('admin creates a season with validated capacity',async()=>{const s=await call('admin','seasons',{name:'Test Season',description:'Soccer',status:'Open',start:today,end:'2027-12-31',open:'2020-01-01',close:'2027-12-31',days:'Tuesday',time:'16:00–17:00',location:'Test field',price:45000,capacity:1,min_age:4,max_age:17,division:'U12',waiver:'Complete sample waiver',questions:'[{"label":"School","required":true}]'});seasonId=s.id;assert.ok(seasonId)});
