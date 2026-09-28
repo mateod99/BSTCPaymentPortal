@@ -1,3 +1,4 @@
+import {signatureJSON,signatureSVG} from '../signature';
 import {all,one,run,id,now,log} from './db';
 import {ageAt,canManage,validateWaiver} from '../rules';
 const fail=(message:string,status=400):never=>{throw Object.assign(Error(message),{status})};
@@ -28,8 +29,9 @@ export async function clubWaiverRoute(u:any,path:string,method:string,b:any){
   const template=await one('SELECT * FROM club_waiver_versions ORDER BY version DESC LIMIT 1');
   if(!template)fail('The club has not published a club waiver yet.');
   if(b.version!==template.version)fail('The waiver has changed. Refresh and review the latest version.',409);
+  const signature=signatureJSON(b.signature);
   const wid=id();
-  await run(`INSERT INTO player_waivers(id,player_id,owner,player_name,dob,text,version,signer,relationship,signed,date) SELECT ?,?,?,?,?,text,version,?,?,?,? FROM club_waiver_versions WHERE version=? AND version=(SELECT MAX(version) FROM club_waiver_versions) ON CONFLICT(player_id,version) DO NOTHING`,wid,player.id,u.id,player.name,player.dob,b.signer.trim(),b.relationship,now(),b.date,template.version);
+  await run(`INSERT INTO player_waivers(id,player_id,owner,player_name,dob,text,version,signer,relationship,signed,date,signature) SELECT ?,?,?,?,?,text,version,?,?,?,?,? FROM club_waiver_versions WHERE version=? AND version=(SELECT MAX(version) FROM club_waiver_versions) ON CONFLICT(player_id,version) DO NOTHING`,wid,player.id,u.id,player.name,player.dob,b.signer.trim(),b.relationship,now(),b.date,signature,template.version);
   const saved=await one('SELECT id FROM player_waivers WHERE player_id=? AND version=?',player.id,template.version);
   if(!saved)fail('The waiver has changed. Refresh and review the latest version.',409);
   if(saved.id===wid)await log(u.id,'Signed club waiver',wid);
@@ -38,7 +40,7 @@ export async function clubWaiverRoute(u:any,path:string,method:string,b:any){
  if(path.startsWith('club-waivers/document/')&&method==='GET'){
   const w=await one('SELECT * FROM player_waivers WHERE id=?'+(canManage(u.role)?'':' AND owner=?'),path.split('/')[2],...(canManage(u.role)?[]:[u.id]));
   if(!w)fail('Signed waiver not found.',404);
-  return new Response(`<!doctype html><html><head><meta charset="utf-8"><title>BSTC · Signed club waiver</title><style>body{font:16px/1.7 Arial;max-width:750px;margin:40px auto;padding:20px}pre{white-space:pre-wrap;font:inherit}@media print{button{display:none}}</style></head><body><h1>BSTC · Signed club waiver</h1><p>Player: ${escape(w.player_name)}<br>Date of birth: ${escape(w.dob)}</p><pre>${escape(w.text)}</pre><hr><p>Electronic signature: <b>${escape(w.signer)}</b><br>Relationship: ${escape(w.relationship)}<br>Confirmed date: ${escape(w.date)}<br>Recorded at (UTC): ${escape(w.signed)}<br>Version: ${w.version}<br>Record: ${escape(w.id)}</p><p>This club waiver does not create a registration or reserve a roster spot.</p><button onclick="window.print()">Print / save as PDF</button></body></html>`,{headers:{'Content-Type':'text/html;charset=utf-8','Cache-Control':'no-store','X-Content-Type-Options':'nosniff'}});
+  return new Response(`<!doctype html><html><head><meta charset="utf-8"><title>BSTC · Signed club waiver</title><style>body{font:16px/1.7 Arial;max-width:750px;margin:40px auto;padding:20px}pre{white-space:pre-wrap;font:inherit}@media print{button{display:none}}</style></head><body><h1>BSTC · Signed club waiver</h1><p>Player: ${escape(w.player_name)}<br>Date of birth: ${escape(w.dob)}</p><pre>${escape(w.text)}</pre><hr>${signatureSVG(w.signature)}<p>Electronic signature: <b>${escape(w.signer)}</b><br>Relationship: ${escape(w.relationship)}<br>Confirmed date: ${escape(w.date)}<br>Recorded at (UTC): ${escape(w.signed)}<br>Version: ${w.version}<br>Record: ${escape(w.id)}</p><p>This club waiver does not create a registration or reserve a roster spot.</p><button onclick="window.print()">Print / save as PDF</button></body></html>`,{headers:{'Content-Type':'text/html;charset=utf-8','Cache-Control':'no-store','X-Content-Type-Options':'nosniff'}});
  }
  fail('Not found.',404);
 }

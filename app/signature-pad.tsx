@@ -1,0 +1,13 @@
+'use client';
+import {useRef,useId} from 'react';
+import type {PointerEvent} from 'react';
+import {signatureJSON,type Signature} from '@/lib/signature';
+export default function SignaturePad({value=[],onChange,disabled=false}:{value?:Signature,onChange:(s:Signature)=>void,disabled?:boolean}){
+ const active=useRef<number|null>(null),drawing=useRef<Signature>([]),label=useId();
+ function point(e:PointerEvent<SVGSVGElement>){const r=e.currentTarget.getBoundingClientRect();return [Math.round(Math.max(0,Math.min(600,(e.clientX-r.left)*600/r.width))*10)/10,Math.round(Math.max(0,Math.min(200,(e.clientY-r.top)*200/r.height))*10)/10];}
+ function start(e:PointerEvent<SVGSVGElement>){if(disabled||active.current!==null||e.button!==0||value.length>=100)return;e.preventDefault();active.current=e.pointerId;e.currentTarget.setPointerCapture(e.pointerId);drawing.current=[...value,[point(e)]];onChange(drawing.current);}
+ function move(e:PointerEvent<SVGSVGElement>){if(active.current!==e.pointerId||disabled)return;e.preventDefault();if(drawing.current.reduce((n,s)=>n+s.length,0)>=2000)return;const strokes=drawing.current,last=strokes[strokes.length-1],p=point(e),previous=last[last.length-1];if(Math.hypot(p[0]-previous[0],p[1]-previous[1])<1)return;drawing.current=[...strokes.slice(0,-1),[...last,p]];onChange(drawing.current);}
+ function end(e:PointerEvent<SVGSVGElement>){if(active.current!==e.pointerId)return;move(e);active.current=null;if(e.currentTarget.hasPointerCapture(e.pointerId))e.currentTarget.releasePointerCapture(e.pointerId);}
+ let signed=false;try{signatureJSON(value);signed=true;}catch{}
+ return <div style={{margin:'16px 0'}}><p id={label}><strong>Handwritten signature *</strong><br/><small>Draw with your mouse, finger, or stylus. Keep your full legal name in the field above.</small></p><svg viewBox="0 0 600 200" preserveAspectRatio="none" aria-labelledby={label} role="img" onPointerDown={start} onPointerMove={move} onPointerUp={end} onPointerCancel={end} onLostPointerCapture={()=>{active.current=null}} style={{display:'block',width:'100%',aspectRatio:'3 / 1',background:'#fff',border:'1px solid #9ca99f',borderRadius:8,touchAction:'none',cursor:'crosshair'}}><line x1="20" y1="165" x2="580" y2="165" stroke="#ddd"/>{value.map((s,i)=><polyline key={i} points={s.map(p=>p.join(',')).join(' ')} fill="none" stroke="#183e28" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"/>)}</svg><div className="between"><small aria-live="polite">{signed?'Signature ready':'Signature required'}</small><button type="button" className="text-button" disabled={disabled||!value.length} onClick={()=>{active.current=null;drawing.current=[];onChange([])}}>Clear signature</button></div></div>;
+}
